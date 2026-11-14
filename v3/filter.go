@@ -95,7 +95,7 @@ func CompileFilter(filter string) (*ber.Packet, error) {
 func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = NewError(ErrorFilterDecompile, errors.New("ldap: error decompiling filter"))
+			err = NewError(ErrorFilterDecompile, fmt.Errorf("ldap: error decompiling filter: %v", r))
 		}
 	}()
 
@@ -105,6 +105,9 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 
 	switch packet.Tag {
 	case FilterAnd:
+		if len(packet.Children) == 0 {
+			return "", NewError(ErrorFilterDecompile, errors.New("ldap: and filter has no children"))
+		}
 		buf.WriteByte('&')
 		for _, child := range packet.Children {
 			childStr, err = DecompileFilter(child)
@@ -114,6 +117,9 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 			buf.WriteString(childStr)
 		}
 	case FilterOr:
+		if len(packet.Children) == 0 {
+			return "", NewError(ErrorFilterDecompile, errors.New("ldap: or filter has no children"))
+		}
 		buf.WriteByte('|')
 		for _, child := range packet.Children {
 			childStr, err = DecompileFilter(child)
@@ -123,6 +129,9 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 			buf.WriteString(childStr)
 		}
 	case FilterNot:
+		if len(packet.Children) != 1 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: not filter must have exactly one child, has %d", len(packet.Children)))
+		}
 		buf.WriteByte('!')
 		childStr, err = DecompileFilter(packet.Children[0])
 		if err != nil {
@@ -131,9 +140,33 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 		buf.WriteString(childStr)
 
 	case FilterSubstrings:
+		if len(packet.Children) != 2 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: substrings filter must have exactly two children, has %d", len(packet.Children)))
+		}
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[0].Data.Bytes())))
 		buf.WriteByte('=')
-		for i, child := range packet.Children[1].Children {
+		substrings := packet.Children[1].Children
+		if len(substrings) == 0 {
+			// A substrings filter with no substrings only matches on
+			// presence, so render it as such to keep the filter
+			// string round-trippable.
+			buf.Write(_SymbolAny)
+			break
+		}
+		for i, child := range substrings {
+			switch child.Tag {
+			case FilterSubstringsInitial:
+				if i != 0 {
+					return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: substrings initial component out of order at index %d", i))
+				}
+			case FilterSubstringsFinal:
+				if i != len(substrings)-1 {
+					return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: substrings final component out of order at index %d", i))
+				}
+			case FilterSubstringsAny:
+			default:
+				return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: unsupported substrings component tag %d", child.Tag))
+			}
 			if i == 0 && child.Tag != FilterSubstringsInitial {
 				buf.Write(_SymbolAny)
 			}
@@ -143,14 +176,23 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 			}
 		}
 	case FilterEqualityMatch:
+		if len(packet.Children) != 2 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: equality match filter must have exactly two children, has %d", len(packet.Children)))
+		}
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[0].Data.Bytes())))
 		buf.WriteByte('=')
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[1].Data.Bytes())))
 	case FilterGreaterOrEqual:
+		if len(packet.Children) != 2 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: greater or equal filter must have exactly two children, has %d", len(packet.Children)))
+		}
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[0].Data.Bytes())))
 		buf.WriteString(">=")
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[1].Data.Bytes())))
 	case FilterLessOrEqual:
+		if len(packet.Children) != 2 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: less or equal filter must have exactly two children, has %d", len(packet.Children)))
+		}
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[0].Data.Bytes())))
 		buf.WriteString("<=")
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[1].Data.Bytes())))
@@ -158,6 +200,9 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Data.Bytes())))
 		buf.WriteString("=*")
 	case FilterApproxMatch:
+		if len(packet.Children) != 2 {
+			return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: approx match filter must have exactly two children, has %d", len(packet.Children)))
+		}
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[0].Data.Bytes())))
 		buf.WriteString("~=")
 		buf.WriteString(EscapeFilter(ber.DecodeString(packet.Children[1].Data.Bytes())))
@@ -166,6 +211,7 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 		dnAttributes := false
 		matchingRule := ""
 		value := ""
+		hasValue := false
 
 		for _, child := range packet.Children {
 			switch child.Tag {
@@ -175,9 +221,15 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 				attr = ber.DecodeString(child.Data.Bytes())
 			case MatchingRuleAssertionMatchValue:
 				value = ber.DecodeString(child.Data.Bytes())
+				hasValue = true
 			case MatchingRuleAssertionDNAttributes:
-				dnAttributes = child.Value.(bool)
+				dnAttributes, _ = child.Value.(bool)
+			default:
+				return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: unsupported matching rule assertion tag %d", child.Tag))
 			}
+		}
+		if !hasValue {
+			return "", NewError(ErrorFilterDecompile, errors.New("ldap: extensible match filter is missing its match value"))
 		}
 
 		if len(attr) > 0 {
@@ -192,6 +244,8 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 		}
 		buf.WriteString(":=")
 		buf.WriteString(EscapeFilter(value))
+	default:
+		return "", NewError(ErrorFilterDecompile, fmt.Errorf("ldap: unsupported filter tag %d", packet.Tag))
 	}
 
 	buf.WriteByte(')')
@@ -200,6 +254,7 @@ func DecompileFilter(packet *ber.Packet) (_ string, err error) {
 }
 
 func compileFilterSet(filter string, pos int, parent *ber.Packet) (int, error) {
+	setLen := 0
 	for pos < len(filter) && filter[pos] == '(' {
 		child, newPos, err := compileFilter(filter, pos+1)
 		if err != nil {
@@ -207,6 +262,10 @@ func compileFilterSet(filter string, pos int, parent *ber.Packet) (int, error) {
 		}
 		pos = newPos
 		parent.AppendChild(child)
+		setLen++
+	}
+	if setLen == 0 {
+		return pos, NewError(ErrorFilterCompile, fmt.Errorf("ldap: expected at least one filter in set at position %d", pos))
 	}
 	if pos >= len(filter) {
 		return pos, NewError(ErrorFilterCompile, errors.New("ldap: unexpected end of filter"))
@@ -375,6 +434,17 @@ func compileFilter(filter string, pos int) (*ber.Packet, int, error) {
 		}
 		if packet == nil {
 			err = NewError(ErrorFilterCompile, errors.New("ldap: error parsing filter"))
+			return packet, newPos, err
+		}
+		if packet.Tag == FilterExtensibleMatch {
+			// RFC 4515 requires an extensible match to carry an
+			// attribute type, a matching rule, or both.
+			if attribute.Len() == 0 && extensibleMatchingRule.Len() == 0 {
+				err = NewError(ErrorFilterCompile, errors.New("ldap: extensible match filter requires an attribute or matching rule"))
+				return packet, newPos, err
+			}
+		} else if attribute.Len() == 0 {
+			err = NewError(ErrorFilterCompile, errors.New("ldap: filter has an empty attribute name"))
 			return packet, newPos, err
 		}
 

@@ -215,6 +215,21 @@ var testInvalidFilters = []string{
 	`(!(a=b)`,
 	`((a=b)`,
 	`(&(a=b)(c=d)`,
+	// empty AND/OR sets
+	`(&)`,
+	`(|)`,
+	`(&())`,
+	`(&(|))`,
+	`(&(&(a=b))(|))`,
+	// empty attribute names
+	`(=foo)`,
+	`(=*)`,
+	`(>=1)`,
+	`(<=1)`,
+	`(~=bar)`,
+	// extensible match without attribute or matching rule
+	`(:=foo)`,
+	`(:dn:=foo)`,
 }
 
 func TestFilter(t *testing.T) {
@@ -280,6 +295,253 @@ func TestInvalidFilter(t *testing.T) {
 	for _, filterStr := range testInvalidFilters {
 		if _, err := CompileFilter(filterStr); err == nil {
 			t.Errorf("Problem compiling %s - expected err", filterStr)
+		}
+	}
+}
+
+func TestCompileFilterStrictRejects(t *testing.T) {
+	testCases := []struct {
+		filter      string
+		expectedErr string
+	}{
+		{filter: "(&)", expectedErr: "expected at least one filter in set"},
+		{filter: "(|)", expectedErr: "expected at least one filter in set"},
+		{filter: "(&(|))", expectedErr: "expected at least one filter in set"},
+		{filter: "(=foo)", expectedErr: "empty attribute name"},
+		{filter: "(=*)", expectedErr: "empty attribute name"},
+		{filter: "(:=foo)", expectedErr: "requires an attribute or matching rule"},
+		{filter: "(:dn:=foo)", expectedErr: "requires an attribute or matching rule"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.filter, func(t *testing.T) {
+			_, err := CompileFilter(tc.filter)
+			if err == nil {
+				t.Fatalf("expected error for filter %q, got nil", tc.filter)
+			}
+			if !strings.Contains(err.Error(), tc.expectedErr) {
+				t.Errorf("filter %q: expected error to contain %q, got %q", tc.filter, tc.expectedErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestDecompileFilterIncompletePacket(t *testing.T) {
+	newEquality := func(children ...*ber.Packet) *ber.Packet {
+		packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterEqualityMatch, nil, FilterMap[FilterEqualityMatch])
+		for _, child := range children {
+			packet.AppendChild(child)
+		}
+		return packet
+	}
+	octetString := func(value string) *ber.Packet {
+		return ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "")
+	}
+
+	testCases := []struct {
+		name        string
+		packet      *ber.Packet
+		expectedErr string
+	}{
+		{
+			name:        "and without children",
+			packet:      ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterAnd, nil, FilterMap[FilterAnd]),
+			expectedErr: "and filter has no children",
+		},
+		{
+			name:        "or without children",
+			packet:      ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterOr, nil, FilterMap[FilterOr]),
+			expectedErr: "or filter has no children",
+		},
+		{
+			name:        "not without children",
+			packet:      ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterNot, nil, FilterMap[FilterNot]),
+			expectedErr: "not filter must have exactly one child",
+		},
+		{
+			name: "not with two children",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterNot, nil, FilterMap[FilterNot])
+				packet.AppendChild(newEquality(octetString("a"), octetString("b")))
+				packet.AppendChild(newEquality(octetString("c"), octetString("d")))
+				return packet
+			}(),
+			expectedErr: "not filter must have exactly one child",
+		},
+		{
+			name:        "equality without children",
+			packet:      newEquality(),
+			expectedErr: "equality match filter must have exactly two children",
+		},
+		{
+			name:        "equality with one child",
+			packet:      newEquality(octetString("a")),
+			expectedErr: "equality match filter must have exactly two children",
+		},
+		{
+			name: "greater or equal with one child",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterGreaterOrEqual, nil, FilterMap[FilterGreaterOrEqual])
+				packet.AppendChild(octetString("a"))
+				return packet
+			}(),
+			expectedErr: "greater or equal filter must have exactly two children",
+		},
+		{
+			name: "less or equal with one child",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterLessOrEqual, nil, FilterMap[FilterLessOrEqual])
+				packet.AppendChild(octetString("a"))
+				return packet
+			}(),
+			expectedErr: "less or equal filter must have exactly two children",
+		},
+		{
+			name: "approx with one child",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterApproxMatch, nil, FilterMap[FilterApproxMatch])
+				packet.AppendChild(octetString("a"))
+				return packet
+			}(),
+			expectedErr: "approx match filter must have exactly two children",
+		},
+		{
+			name: "substrings with one child",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterSubstrings, nil, FilterMap[FilterSubstrings])
+				packet.AppendChild(octetString("a"))
+				return packet
+			}(),
+			expectedErr: "substrings filter must have exactly two children",
+		},
+		{
+			name: "substrings with unsupported component tag",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterSubstrings, nil, FilterMap[FilterSubstrings])
+				packet.AppendChild(octetString("a"))
+				seq := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Substrings")
+				seq.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, ber.Tag(3), "b", ""))
+				packet.AppendChild(seq)
+				return packet
+			}(),
+			expectedErr: "unsupported substrings component tag",
+		},
+		{
+			name: "substrings with out of order initial",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterSubstrings, nil, FilterMap[FilterSubstrings])
+				packet.AppendChild(octetString("a"))
+				seq := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Substrings")
+				seq.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, FilterSubstringsAny, "b", ""))
+				seq.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, FilterSubstringsInitial, "c", ""))
+				packet.AppendChild(seq)
+				return packet
+			}(),
+			expectedErr: "initial component out of order",
+		},
+		{
+			name: "substrings with out of order final",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterSubstrings, nil, FilterMap[FilterSubstrings])
+				packet.AppendChild(octetString("a"))
+				seq := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Substrings")
+				seq.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, FilterSubstringsFinal, "b", ""))
+				seq.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, FilterSubstringsAny, "c", ""))
+				packet.AppendChild(seq)
+				return packet
+			}(),
+			expectedErr: "final component out of order",
+		},
+		{
+			name: "extensible match without match value",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterExtensibleMatch, nil, FilterMap[FilterExtensibleMatch])
+				packet.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, MatchingRuleAssertionType, "cn", ""))
+				return packet
+			}(),
+			expectedErr: "missing its match value",
+		},
+		{
+			name: "extensible match with unsupported assertion tag",
+			packet: func() *ber.Packet {
+				packet := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterExtensibleMatch, nil, FilterMap[FilterExtensibleMatch])
+				packet.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, ber.Tag(5), "x", ""))
+				return packet
+			}(),
+			expectedErr: "unsupported matching rule assertion tag",
+		},
+		{
+			name:        "unsupported filter tag",
+			packet:      ber.Encode(ber.ClassContext, ber.TypeConstructed, ber.Tag(42), nil, "Unknown"),
+			expectedErr: "unsupported filter tag",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecompileFilter(tc.packet)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.expectedErr) {
+				t.Errorf("expected error to contain %q, got %q", tc.expectedErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestFilterSubstringWildcardRoundTrip(t *testing.T) {
+	// A substrings filter whose components are all empty only matches on
+	// presence; decompiling must yield a filter string that compiles again.
+	packet, err := CompileFilter("(sn=**)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decompiled, err := DecompileFilter(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decompiled != "(sn=*)" {
+		t.Errorf("expected %q, got %q", "(sn=*)", decompiled)
+	}
+	if _, err := CompileFilter(decompiled); err != nil {
+		t.Errorf("decompiled filter %q does not compile: %v", decompiled, err)
+	}
+
+	// Every compilable filter must survive a compile/decompile/compile
+	// round trip and stabilize.
+	for _, filterStr := range []string{
+		`(sn=Mi*l*r)`,
+		`(sn=*i*le*)`,
+		`(cn=\28not a group\29)`,
+		`(cn=back\5cslash)`,
+		`(cn=\2a)`,
+		`(&(objectClass=person)(|(cn=Mi*l*r)(!(sn=*))))`,
+		`(|(cn:dn:1.2.3:=x)(memberOf:1.2.840.113556.1.4.1941:=CN=User1,DC=net))`,
+		`(&(!(o:dn:=Ace Industry))(sn:dn:2.4.6.8.10:=Barney Rubble))`,
+	} {
+		first, err := CompileFilter(filterStr)
+		if err != nil {
+			t.Errorf("compiling %q: %v", filterStr, err)
+			continue
+		}
+		decompiled, err := DecompileFilter(first)
+		if err != nil {
+			t.Errorf("decompiling %q: %v", filterStr, err)
+			continue
+		}
+		second, err := CompileFilter(decompiled)
+		if err != nil {
+			t.Errorf("recompiling %q (from %q): %v", decompiled, filterStr, err)
+			continue
+		}
+		again, err := DecompileFilter(second)
+		if err != nil {
+			t.Errorf("re-decompiling %q: %v", decompiled, err)
+			continue
+		}
+		if again != decompiled {
+			t.Errorf("filter %q did not stabilize: %q then %q", filterStr, decompiled, again)
 		}
 	}
 }
